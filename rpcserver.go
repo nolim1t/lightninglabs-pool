@@ -23,6 +23,7 @@ import (
 	"github.com/lightninglabs/pool/chaninfo"
 	"github.com/lightninglabs/pool/clientdb"
 	"github.com/lightninglabs/pool/event"
+	"github.com/lightninglabs/pool/funding"
 	"github.com/lightninglabs/pool/order"
 	"github.com/lightninglabs/pool/poolrpc"
 	"github.com/lightninglabs/pool/poolscript"
@@ -59,12 +60,6 @@ type rpcServer struct {
 	auctioneer     *auctioneer.Client
 	accountManager *account.Manager
 	orderManager   *order.Manager
-	fundingManager *fundingMgr
-
-	// pendingOpenChannels is a channel through which we'll send received
-	// notifications for pending open channels resulting from a successful
-	// batch.
-	pendingOpenChannels chan<- *lnrpc.ChannelEventUpdate_PendingOpenChannel
 
 	quit                           chan struct{}
 	wg                             sync.WaitGroup
@@ -87,7 +82,7 @@ type accountStore struct {
 var _ account.Store = (*accountStore)(nil)
 
 func (s *accountStore) PendingBatch() error {
-	_, _, err := s.DB.PendingBatch()
+	_, err := s.DB.PendingBatchSnapshot()
 	return err
 }
 
@@ -97,8 +92,6 @@ func (s *accountStore) PendingBatch() error {
 func newRPCServer(server *Server) *rpcServer {
 	accountStore := &accountStore{server.db}
 	lndServices := &server.lndServices.LndServices
-	pendingOpenChannels := make(chan *lnrpc.ChannelEventUpdate_PendingOpenChannel)
-	quit := make(chan struct{})
 	return &rpcServer{
 		server:      server,
 		lndServices: lndServices,
@@ -121,18 +114,7 @@ func newRPCServer(server *Server) *rpcServer {
 			Wallet:    lndServices.WalletKit,
 			Signer:    lndServices.Signer,
 		}),
-		fundingManager: &fundingMgr{
-			db:                  server.db,
-			walletKit:           lndServices.WalletKit,
-			lightningClient:     lndServices.Client,
-			baseClient:          server.lndClient,
-			pendingOpenChannels: pendingOpenChannels,
-			quit:                quit,
-			batchStepTimeout:    defaultBatchStepTimeout,
-			newNodesOnly:        server.cfg.NewNodesOnly,
-		},
-		pendingOpenChannels: pendingOpenChannels,
-		quit:                quit,
+		quit: make(chan struct{}),
 	}
 }
 
@@ -255,7 +237,7 @@ func (s *rpcServer) consumePendingOpenChannels(
 		}
 
 		select {
-		case s.pendingOpenChannels <- channel:
+		case s.server.fundingManager.PendingOpenChannels <- channel:
 		case <-s.quit:
 			return
 		}
@@ -380,33 +362,19 @@ func (s *rpcServer) handleServerMessage(rpcMsg *poolrpc.ServerAuctionMessage) er
 		}
 
 		// The prepare message can be sent over and over again if the
-		// batch needs adjustment. Clear all previous shims.
+		// batch needs adjustment. Clear all previous shims and channels
+		// that will never complete because the funding TX they refer to
+		// will never be published.
 		if s.orderManager.HasPendingBatch() {
 			pendingBatch := s.orderManager.PendingBatch()
-			orderFetcher := s.server.db.GetOrder
-			err := pendingBatch.CancelPendingFundingShims(
-				s.lndClient, orderFetcher,
+			err = s.server.fundingManager.RemovePendingBatchArtifacts(
+				pendingBatch.MatchedOrders, pendingBatch.BatchTX,
 			)
 			if err != nil {
-				// CancelPendingFundingShims only returns hard
-				// errors that justify us rejecting the batch.
-				rpcLog.Errorf("Error clearing previous batch: "+
-					"%v", err)
-				return s.sendRejectBatch(batch, err)
-			}
-
-			// Also abandon any channels that might still be pending
-			// from a previous round of the same batch or a previous
-			// batch that we didn't make it into the final round.
-			err = pendingBatch.AbandonCanceledChannels(
-				s.lndServices.WalletKit, s.lndClient,
-				orderFetcher,
-			)
-			if err != nil {
-				// AbandonCanceledChannels only returns hard
-				// errors that justify us rejecting the batch.
-				rpcLog.Errorf("Error abandoning channels from "+
-					"last batch: %v", err)
+				// The above method only returns hard errors
+				// that justify us rejecting the batch.
+				rpcLog.Errorf("Error clearing previous batch "+
+					"artifacts: %v", err)
 				return s.sendRejectBatch(batch, err)
 			}
 		}
@@ -435,8 +403,8 @@ func (s *rpcServer) handleServerMessage(rpcMsg *poolrpc.ServerAuctionMessage) er
 		// Before we accept the batch, we'll finish preparations on our
 		// end which include applying any order match predicates,
 		// connecting out to peers, and registering funding shim.
-		err = s.fundingManager.prepChannelFunding(
-			batch, nodeHasTorAddrs(nodeInfo.Uris),
+		err = s.server.fundingManager.PrepChannelFunding(
+			batch, nodeHasTorAddrs(nodeInfo.Uris), s.quit,
 		)
 		if err != nil {
 			rpcLog.Warnf("Error preparing channel funding: %v",
@@ -456,7 +424,9 @@ func (s *rpcServer) handleServerMessage(rpcMsg *poolrpc.ServerAuctionMessage) er
 		// then start negotiating with the remote peers. We'll sign
 		// once all channel partners have responded.
 		batch := s.orderManager.PendingBatch()
-		channelKeys, err := s.fundingManager.batchChannelSetup(batch)
+		channelKeys, err := s.server.fundingManager.BatchChannelSetup(
+			batch, s.quit,
+		)
 		if err != nil {
 			rpcLog.Errorf("Error setting up channels: %v", err)
 			return s.sendRejectBatch(batch, err)
@@ -1390,8 +1360,8 @@ func (s *rpcServer) sendRejectBatch(batch *order.Batch, failure error) error {
 	// As we're rejecting this batch, we'll now cancel all funding shims
 	// that we may have registered since we may be matched with a distinct
 	// set of channels if this batch is repeated.
-	err := batch.CancelPendingFundingShims(
-		s.lndClient,
+	err := funding.CancelPendingFundingShims(
+		batch.MatchedOrders, s.lndClient,
 		func(o order.Nonce) (order.Order, error) {
 			return s.server.db.GetOrder(o)
 		},
@@ -1408,7 +1378,7 @@ func (s *rpcServer) sendRejectBatch(batch *order.Batch, failure error) error {
 	}
 
 	// Attach the status code to the message to give a bit more context.
-	var partialReject *matchRejectErr
+	var partialReject *funding.MatchRejectErr
 	switch {
 	case errors.Is(failure, order.ErrVersionMismatch):
 		msg.Reject.ReasonCode = poolrpc.OrderMatchReject_BATCH_VERSION_MISMATCH
@@ -1437,14 +1407,14 @@ func (s *rpcServer) sendRejectBatch(batch *order.Batch, failure error) error {
 	case errors.As(failure, &partialReject):
 		msg.Reject.ReasonCode = poolrpc.OrderMatchReject_PARTIAL_REJECT
 		msg.Reject.RejectedOrders = make(map[string]*poolrpc.OrderReject)
-		for nonce, reject := range partialReject.rejectedOrders {
+		for nonce, reject := range partialReject.RejectedOrders {
 			msg.Reject.RejectedOrders[nonce.String()] = reject
 		}
 
 		// Track this reject by adding an event to our orders with the
 		// specific reject code for each of rejected orders.
 		err := s.server.db.StoreBatchPartialRejectEvents(
-			batch, partialReject.rejectedOrders,
+			batch, partialReject.RejectedOrders,
 		)
 		if err != nil {
 			rpcLog.Errorf("Could not store match event: %v", err)
